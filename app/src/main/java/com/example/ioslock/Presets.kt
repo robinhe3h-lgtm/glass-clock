@@ -10,6 +10,11 @@ class Preset(
 object Presets {
     const val PREFS = "clock_prefs"
     const val KEY = "preset"
+    const val KEY_TARGET = "target"
+    const val KEY_ANIM = "animate"
+    const val TARGET_LOCK = 0
+    const val TARGET_HOME = 1
+    const val TARGET_BOTH = 2
 
     val all: List<Preset> = listOf(
         Preset(

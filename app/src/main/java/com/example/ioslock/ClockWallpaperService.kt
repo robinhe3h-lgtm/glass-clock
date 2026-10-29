@@ -14,12 +14,23 @@ import android.graphics.Path
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.service.wallpaper.WallpaperService
 import android.text.format.DateFormat
 import android.view.SurfaceHolder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+// Wake-up animation timing (milliseconds)
+private const val STAGGER_MS = 90L
+private const val DIGIT_MS = 700f
+private const val DATE_MS = 500f
+private const val MOUNTAIN_MS = 900f
+private const val ANIM_TOTAL_MS = 1300L
+private const val FRAME_MS = 16L
 
 class ClockWallpaperService : WallpaperService() {
 
@@ -30,6 +41,10 @@ class ClockWallpaperService : WallpaperService() {
         private var visible = false
         private var receiverRegistered = false
 
+        private val handler = Handler(Looper.getMainLooper())
+        private var animating = false
+        private var animStart = 0L
+
         private val bgPaint = Paint()
         private val mountainPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val datePaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -39,6 +54,15 @@ class ClockWallpaperService : WallpaperService() {
         private val tickReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 draw()
+            }
+        }
+
+        private val frameRunnable = object : Runnable {
+            override fun run() {
+                if (!visible) return
+                if (SystemClock.uptimeMillis() - animStart >= ANIM_TOTAL_MS) animating = false
+                draw()
+                if (animating) handler.postDelayed(this, FRAME_MS)
             }
         }
 
@@ -75,9 +99,25 @@ class ClockWallpaperService : WallpaperService() {
             this.visible = visible
             if (visible) {
                 registerTick()
-                draw()
+                startAnimation()
             } else {
                 unregisterTick()
+                handler.removeCallbacks(frameRunnable)
+                animating = false
+            }
+        }
+
+        /** Runs every time the screen turns on or the wallpaper becomes visible again. */
+        private fun startAnimation() {
+            val prefs = getSharedPreferences(Presets.PREFS, Context.MODE_PRIVATE)
+            handler.removeCallbacks(frameRunnable)
+            if (prefs.getBoolean(Presets.KEY_ANIM, true)) {
+                animStart = SystemClock.uptimeMillis()
+                animating = true
+                handler.post(frameRunnable)
+            } else {
+                animating = false
+                draw()
             }
         }
 
@@ -97,6 +137,7 @@ class ClockWallpaperService : WallpaperService() {
         }
 
         override fun onDestroy() {
+            handler.removeCallbacks(frameRunnable)
             unregisterTick()
             super.onDestroy()
         }
@@ -134,18 +175,38 @@ class ClockWallpaperService : WallpaperService() {
             }
         }
 
-        /** On Android 14+ the clock only shows on the lock screen; the home screen stays clean. */
+        /**
+         * Uses the "Show the clock on" choice from the app (lock / home / both).
+         * Telling the two screens apart needs Android 14+; older versions show the clock on both.
+         */
         private fun shouldShowClock(): Boolean {
             if (isPreview) return true
+            val prefs = getSharedPreferences(Presets.PREFS, Context.MODE_PRIVATE)
+            val target = prefs.getInt(Presets.KEY_TARGET, Presets.TARGET_LOCK)
+            if (target == Presets.TARGET_BOTH) return true
             if (Build.VERSION.SDK_INT >= 34) {
                 val flags = try {
                     wallpaperFlags
                 } catch (e: Exception) {
                     return true
                 }
-                return (flags and WallpaperManager.FLAG_LOCK) != 0
+                if (flags == 0) return true
+                val isLock = (flags and WallpaperManager.FLAG_LOCK) != 0
+                val isHome = (flags and WallpaperManager.FLAG_SYSTEM) != 0
+                if (isLock && isHome) return true
+                return if (target == Presets.TARGET_LOCK) isLock else isHome
             }
             return true
+        }
+
+        private fun elapsedMs(): Long =
+            if (animating) SystemClock.uptimeMillis() - animStart else Long.MAX_VALUE / 4
+
+        /** 0 to 1 with a fast start and a soft landing. */
+        private fun ease(t: Float): Float {
+            val c = t.coerceIn(0f, 1f)
+            val inv = 1f - c
+            return 1f - inv * inv * inv
         }
 
         private fun drawFrame(canvas: Canvas) {
@@ -154,6 +215,7 @@ class ClockWallpaperService : WallpaperService() {
 
             val prefs = getSharedPreferences(Presets.PREFS, Context.MODE_PRIVATE)
             val preset = Presets.get(prefs.getInt(Presets.KEY, 0))
+            val elapsed = elapsedMs()
 
             bgPaint.shader = LinearGradient(
                 0f, 0f, 0f, h,
@@ -163,12 +225,12 @@ class ClockWallpaperService : WallpaperService() {
             )
             canvas.drawRect(0f, 0f, w, h, bgPaint)
 
-            if (shouldShowClock()) drawClock(canvas, w, h)
+            if (shouldShowClock()) drawClock(canvas, w, h, elapsed)
 
-            drawMountains(canvas, w, h, preset)
+            drawMountains(canvas, w, h, preset, elapsed)
         }
 
-        private fun drawClock(canvas: Canvas, w: Float, h: Float) {
+        private fun drawClock(canvas: Canvas, w: Float, h: Float, elapsed: Long) {
             val now = Date()
             val locale = Locale.getDefault()
 
@@ -180,8 +242,15 @@ class ClockWallpaperService : WallpaperService() {
             val datePattern = DateFormat.getBestDateTimePattern(locale, "EEEdMMM")
             val dateText = SimpleDateFormat(datePattern, locale).format(now)
 
+            val dateP = ease(elapsed.toFloat() / DATE_MS)
             datePaint.textSize = w * 0.05f
-            canvas.drawText(dateText, w / 2f, h * 0.075f, datePaint)
+            datePaint.alpha = (238 * dateP).toInt()
+            canvas.drawText(
+                dateText,
+                w / 2f,
+                h * 0.075f + (1f - dateP) * h * 0.012f,
+                datePaint
+            )
 
             val gap = 0.15f
             val colonW = 0.32f
@@ -208,22 +277,36 @@ class ClockWallpaperService : WallpaperService() {
             dotPaint.shader = glass
 
             var x = (w - units * dw) / 2f
-            timeText.forEach { ch ->
+            timeText.forEachIndexed { index, ch ->
+                // Each digit starts a little after the one before it
+                val p = ease((elapsed - index * STAGGER_MS).toFloat() / DIGIT_MS)
+                val alpha = (255 * p).toInt()
+                digitPaint.alpha = alpha
+                dotPaint.alpha = alpha
+
+                val cellW = if (ch == ':') colonW * dw else dw
+                val scale = 0.9f + 0.1f * p
+
+                canvas.save()
+                canvas.translate(0f, (1f - p) * dh * 0.10f)
+                canvas.scale(scale, scale, x + cellW / 2f, top + dh)
+
                 if (ch == ':') {
-                    val r = colonW * dw / 2f
+                    val r = cellW / 2f
                     canvas.drawCircle(x + r, top + dh * 0.315f, r, dotPaint)
                     canvas.drawCircle(x + r, top + dh * 0.757f, r, dotPaint)
-                    x += colonW * dw
                 } else {
                     canvas.drawPath(TallDigits.path(ch, x, top, dw, dh), digitPaint)
-                    x += dw
                 }
-                x += gap * dw
+                canvas.restore()
+
+                x += cellW + gap * dw
             }
         }
 
-        private fun drawMountains(canvas: Canvas, w: Float, h: Float, preset: Preset) {
+        private fun drawMountains(canvas: Canvas, w: Float, h: Float, preset: Preset, elapsed: Long) {
             mountainPaint.pathEffect = CornerPathEffect(w * 0.012f)
+            val rise = 1f - ease(elapsed.toFloat() / MOUNTAIN_MS)
 
             val back = Path().apply {
                 moveTo(0f, h * 0.52f)
@@ -239,7 +322,10 @@ class ClockWallpaperService : WallpaperService() {
                 close()
             }
             mountainPaint.color = preset.mountainBack
+            canvas.save()
+            canvas.translate(0f, rise * h * 0.04f)
             canvas.drawPath(back, mountainPaint)
+            canvas.restore()
 
             val front = Path().apply {
                 moveTo(0f, h * 0.60f)
@@ -254,7 +340,10 @@ class ClockWallpaperService : WallpaperService() {
                 close()
             }
             mountainPaint.color = preset.mountainFront
+            canvas.save()
+            canvas.translate(0f, rise * h * 0.07f)
             canvas.drawPath(front, mountainPaint)
+            canvas.restore()
         }
     }
 }
