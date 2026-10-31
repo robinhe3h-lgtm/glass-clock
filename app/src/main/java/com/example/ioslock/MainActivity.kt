@@ -1,7 +1,6 @@
 package com.example.ioslock
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.app.WallpaperManager
 import android.content.ComponentName
 import android.content.Intent
@@ -16,12 +15,9 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.util.DisplayMetrics
-import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -30,7 +26,6 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 private const val REQ_BACKGROUND = 41
-private const val REQ_HOME = 42
 
 class MainActivity : Activity() {
 
@@ -62,35 +57,17 @@ class MainActivity : Activity() {
         root.addView(checkbox("Show mountains", Presets.KEY_MOUNTAINS, true))
         root.addView(checkbox("Animate the clock when the screen turns on", Presets.KEY_ANIM, true))
 
-        // 2. Where
-        root.addView(label("2. Show the clock on"))
-        val saved = prefs.getInt(Presets.KEY_TARGET, Presets.TARGET_LOCK)
-        val group = RadioGroup(this)
-        listOf(
-            "Lock screen" to Presets.TARGET_LOCK,
-            "Home screen" to Presets.TARGET_HOME,
-            "Both screens" to Presets.TARGET_BOTH
-        ).forEach { (name, value) ->
-            group.addView(RadioButton(this).apply {
-                text = name
-                id = View.generateViewId()
-                isChecked = value == saved
-                setOnClickListener { prefs.edit().putInt(Presets.KEY_TARGET, value).apply() }
-            })
-        }
-        root.addView(group)
+        // 2. Set
+        root.addView(label("2. Set it"))
         root.addView(note(
-            "Choosing lock or home only needs Android 14 or newer. " +
-                "If your phone's window only offers Home or Both, pick Both: " +
-                "for the lock screen option, the app will then offer to keep your home screen separate."
+            "On the next screen, tap Set wallpaper and choose \"Home screen and lock screen\". " +
+                "The clock shows on the lock screen only. Your home screen shows the same " +
+                "background without the clock."
         ))
-
-        // 3. Set
-        root.addView(label("3. Set it"))
         root.addView(button("Set as wallpaper") { openWallpaperPicker() })
 
-        // 4. System clock
-        root.addView(label("4. Hide your phone's own clock"))
+        // 3. System clock
+        root.addView(label("3. Hide your phone's own clock"))
         root.addView(note(
             "Your phone draws its own clock on top. In Settings, look for Lock screen, " +
                 "then Clock style, and turn it off or choose none."
@@ -104,14 +81,6 @@ class MainActivity : Activity() {
         })
 
         setContentView(ScrollView(this).apply { addView(root) })
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (prefs.getBoolean(Presets.KEY_PENDING_LOCK_ONLY, false)) {
-            prefs.edit().putBoolean(Presets.KEY_PENDING_LOCK_ONLY, false).apply()
-            if (clockIsHomeWallpaper()) showLockOnlyDialog()
-        }
     }
 
     // ---------- small UI helpers ----------
@@ -186,7 +155,7 @@ class MainActivity : Activity() {
         recreate()
     }
 
-    // ---------- picking and preparing pictures ----------
+    // ---------- picking and preparing the photo ----------
 
     private fun pickImage(code: Int) {
         val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
@@ -204,7 +173,7 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         val uri = data?.data
         if (resultCode != RESULT_OK || uri == null) return
-        if (requestCode != REQ_BACKGROUND && requestCode != REQ_HOME) return
+        if (requestCode != REQ_BACKGROUND) return
 
         val size = screenSize()
         toast("Loading picture...")
@@ -213,10 +182,8 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (bmp == null) {
                     toast("Couldn't open that picture")
-                } else if (requestCode == REQ_BACKGROUND) {
-                    saveBackground(bmp)
                 } else {
-                    setHomePicture(bmp)
+                    saveBackground(bmp)
                 }
             }
         }.start()
@@ -287,8 +254,6 @@ class MainActivity : Activity() {
     // ---------- setting the wallpaper ----------
 
     private fun openWallpaperPicker() {
-        val lockOnly = prefs.getInt(Presets.KEY_TARGET, Presets.TARGET_LOCK) == Presets.TARGET_LOCK
-        prefs.edit().putBoolean(Presets.KEY_PENDING_LOCK_ONLY, lockOnly).apply()
         try {
             val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
                 putExtra(
@@ -303,47 +268,6 @@ class MainActivity : Activity() {
             } catch (e2: Exception) {
                 toast("Open Settings, then Wallpaper, and choose Glass Clock Wallpaper")
             }
-        }
-    }
-
-    private fun clockIsHomeWallpaper(): Boolean = try {
-        WallpaperManager.getInstance(this).wallpaperInfo?.serviceName ==
-            ClockWallpaperService::class.java.name
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun showLockOnlyDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Clock on the lock screen only?")
-            .setMessage(
-                "Your phone also put the clock on the home screen. To keep it on the lock " +
-                    "screen only, give your home screen its own picture.\n\n" +
-                    "This changes your home screen picture. If your lock screen goes plain " +
-                    "afterwards, set the clock again and choose Both."
-            )
-            .setPositiveButton("Choose my picture") { _, _ -> pickImage(REQ_HOME) }
-            .setNeutralButton("Matching scenery") { _, _ -> useSceneryForHome() }
-            .setNegativeButton("Keep both") { _, _ -> }
-            .show()
-    }
-
-    private fun useSceneryForHome() {
-        val size = screenSize()
-        val index = prefs.getInt(Presets.KEY, 0)
-        Thread {
-            val bmp = Scene().renderBitmap(size.first, size.second, index)
-            runOnUiThread { setHomePicture(bmp) }
-        }.start()
-    }
-
-    private fun setHomePicture(bmp: Bitmap) {
-        try {
-            WallpaperManager.getInstance(this)
-                .setBitmap(bmp, null, true, WallpaperManager.FLAG_SYSTEM)
-            toast("Home screen picture set")
-        } catch (e: Exception) {
-            toast("Couldn't set the home screen picture")
         }
     }
 }

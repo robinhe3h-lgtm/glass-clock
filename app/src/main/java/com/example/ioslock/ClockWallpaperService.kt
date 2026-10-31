@@ -1,6 +1,6 @@
 package com.example.ioslock
 
-import android.app.WallpaperManager
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -17,6 +17,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import android.service.wallpaper.WallpaperService
 import android.text.format.DateFormat
@@ -34,6 +35,7 @@ private const val DATE_MS = 450f
 private const val MOUNTAIN_MS = 800f
 private const val LEAD_IN_MS = 180L      // starts the animation already this far in, so it never feels late
 private const val ANIM_TOTAL_MS = 1000L
+private const val FADE_MS = 250f         // how fast the clock fades away after you unlock
 private const val HIDDEN = -1_000_000L   // "before the animation starts" state
 private const val DONE = 1_000_000L      // "animation finished" state
 
@@ -50,6 +52,8 @@ class ClockWallpaperService : WallpaperService() {
     inner class ClockEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener {
 
         private val prefs = getSharedPreferences(Presets.PREFS, Context.MODE_PRIVATE)
+        private val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        private val power = getSystemService(Context.POWER_SERVICE) as PowerManager
 
         private var visible = false
         private var animating = false
@@ -57,9 +61,16 @@ class ClockWallpaperService : WallpaperService() {
         private var animStart = 0L
         private var useHardware = Build.VERSION.SDK_INT >= 26
 
+        // The clock only shows while the lock screen is showing
+        private var clockOn = true
+        private var fadingOut = false
+        private var fadeStart = 0L
+
+        // How far the launcher has scrolled the wallpaper (0 to 1). Used to keep the clock centered.
+        private var xOffset = 0.5f
+
         // Settings, read once and refreshed only when they change
         private var presetIndex = 0
-        private var target = Presets.TARGET_LOCK
         private var animOn = true
         private var mountainsOn = true
         private var photoMode = false
@@ -71,6 +82,7 @@ class ClockWallpaperService : WallpaperService() {
         private val scrimPaint = Paint()
         private var scrimH = 0f
         private val dst = RectF()
+        private val bounds = RectF()
 
         private val datePaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val digitPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -85,15 +97,16 @@ class ClockWallpaperService : WallpaperService() {
         private var layoutText = ""
         private var dh = 0f
         private var top = 0f
+        private var inkShift = 0f
 
         private val frameCallback = object : Choreographer.FrameCallback {
             override fun doFrame(frameTimeNanos: Long) {
-                if (!visible || !animating) return
-                if (SystemClock.uptimeMillis() - animStart + LEAD_IN_MS >= ANIM_TOTAL_MS) {
-                    animating = false
-                }
+                if (!visible) return
+                val now = SystemClock.uptimeMillis()
+                if (animating && now - animStart + LEAD_IN_MS >= ANIM_TOTAL_MS) animating = false
+                if (fadingOut && (now - fadeStart).toFloat() >= FADE_MS) fadingOut = false
                 draw()
-                if (animating) Choreographer.getInstance().postFrameCallback(this)
+                if (animating || fadingOut) Choreographer.getInstance().postFrameCallback(this)
             }
         }
 
@@ -101,16 +114,19 @@ class ClockWallpaperService : WallpaperService() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> {
+                        Choreographer.getInstance().removeFrameCallback(frameCallback)
+                        animating = false
+                        fadingOut = false
+                        clockOn = true
                         if (animOn) {
-                            Choreographer.getInstance().removeFrameCallback(frameCallback)
-                            animating = false
                             hidden = true
                             draw(true)
                         }
                     }
                     Intent.ACTION_SCREEN_ON -> {
-                        if (visible && animOn) startAnimation()
+                        if (visible) onWake()
                     }
+                    Intent.ACTION_USER_PRESENT -> startFadeOut()
                     else -> {
                         refreshText()
                         draw()
@@ -141,6 +157,7 @@ class ClockWallpaperService : WallpaperService() {
             filter.addAction(Intent.ACTION_TIMEZONE_CHANGED)
             filter.addAction(Intent.ACTION_SCREEN_ON)
             filter.addAction(Intent.ACTION_SCREEN_OFF)
+            filter.addAction(Intent.ACTION_USER_PRESENT)
             registerReceiver(receiver, filter)
         }
 
@@ -174,7 +191,6 @@ class ClockWallpaperService : WallpaperService() {
 
         private fun loadPrefs() {
             presetIndex = prefs.getInt(Presets.KEY, 0).coerceIn(0, Presets.all.size - 1)
-            target = prefs.getInt(Presets.KEY_TARGET, Presets.TARGET_LOCK)
             animOn = prefs.getBoolean(Presets.KEY_ANIM, true)
             mountainsOn = prefs.getBoolean(Presets.KEY_MOUNTAINS, true)
             photoMode = prefs.getInt(Presets.KEY_BG_MODE, 0) == 1
@@ -222,19 +238,55 @@ class ClockWallpaperService : WallpaperService() {
             dateText = SimpleDateFormat(datePattern, locale).format(now)
         }
 
-        // ---------- visibility and animation ----------
+        // ---------- lock screen detection, visibility and animation ----------
+
+        private fun lockScreenShowing(): Boolean {
+            if (isPreview) return true
+            return try {
+                keyguard.isKeyguardLocked
+            } catch (e: Exception) {
+                true
+            }
+        }
+
+        /** The screen turned on or the wallpaper became visible. */
+        private fun onWake() {
+            clockOn = lockScreenShowing()
+            fadingOut = false
+            if (clockOn) {
+                startAnimation()
+            } else {
+                // Home screen: no clock, nothing to animate
+                hidden = false
+                animating = false
+                draw()
+            }
+        }
+
+        /** The user unlocked the phone, so the clock fades away and the home screen stays clean. */
+        private fun startFadeOut() {
+            if (!clockOn) return
+            clockOn = false
+            if (!visible) return
+            fadingOut = true
+            fadeStart = SystemClock.uptimeMillis()
+            val choreographer = Choreographer.getInstance()
+            choreographer.removeFrameCallback(frameCallback)
+            choreographer.postFrameCallback(frameCallback)
+        }
 
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
             if (visible) {
                 refreshText()
-                startAnimation()
+                onWake()
             } else {
                 Choreographer.getInstance().removeFrameCallback(frameCallback)
                 animating = false
-                if (animOn) {
-                    // Paint the "before" frame now, so the next time the screen turns on it
-                    // already shows an empty start and never flashes the finished clock.
+                fadingOut = false
+                if (animOn && !power.isInteractive) {
+                    // Screen is off: paint the "before" frame now, so the next time the screen
+                    // turns on it already shows an empty start and never flashes the finished clock.
                     hidden = true
                     draw(true)
                 }
@@ -252,9 +304,10 @@ class ClockWallpaperService : WallpaperService() {
             if (animating && now - animStart < 500L) return   // already started a moment ago
             animStart = now
             animating = true
-            Choreographer.getInstance().removeFrameCallback(frameCallback)
+            val choreographer = Choreographer.getInstance()
+            choreographer.removeFrameCallback(frameCallback)
             draw()   // first frame right away, no waiting for the next vsync
-            Choreographer.getInstance().postFrameCallback(frameCallback)
+            choreographer.postFrameCallback(frameCallback)
         }
 
         private fun currentElapsed(): Long = when {
@@ -263,11 +316,27 @@ class ClockWallpaperService : WallpaperService() {
             else -> DONE
         }
 
+        /** 1 while the clock is shown, fading to 0 after unlock, 0 on the home screen. */
+        private fun clockFade(): Float = when {
+            clockOn -> 1f
+            fadingOut -> 1f - ease((SystemClock.uptimeMillis() - fadeStart).toFloat() / FADE_MS)
+            else -> 0f
+        }
+
         /** 0 to 1 with a fast start and a soft landing. */
         private fun ease(t: Float): Float {
             val c = t.coerceIn(0f, 1f)
             val inv = 1f - c
             return 1f - inv * inv * inv
+        }
+
+        override fun onOffsetsChanged(
+            xOffset: Float, yOffset: Float,
+            xOffsetStep: Float, yOffsetStep: Float,
+            xPixelOffset: Int, yPixelOffset: Int
+        ) {
+            this.xOffset = xOffset
+            if (visible) draw()
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
@@ -318,28 +387,6 @@ class ClockWallpaperService : WallpaperService() {
             return holder.lockCanvas()
         }
 
-        /**
-         * Uses the "Show the clock on" choice from the app (lock / home / both).
-         * Telling the two screens apart needs Android 14+; older versions show the clock on both.
-         */
-        private fun shouldShowClock(): Boolean {
-            if (isPreview) return true
-            if (target == Presets.TARGET_BOTH) return true
-            if (Build.VERSION.SDK_INT >= 34) {
-                val flags = try {
-                    wallpaperFlags
-                } catch (e: Exception) {
-                    return true
-                }
-                if (flags == 0) return true
-                val isLock = (flags and WallpaperManager.FLAG_LOCK) != 0
-                val isHome = (flags and WallpaperManager.FLAG_SYSTEM) != 0
-                if (isLock && isHome) return true
-                return if (target == Presets.TARGET_LOCK) isLock else isHome
-            }
-            return true
-        }
-
         private fun drawFrame(canvas: Canvas, elapsed: Long) {
             val w = canvas.width.toFloat()
             val h = canvas.height.toFloat()
@@ -364,23 +411,31 @@ class ClockWallpaperService : WallpaperService() {
                 scene.drawSky(canvas)
             }
 
-            if (shouldShowClock()) drawClock(canvas, w, h, elapsed)
+            val fade = clockFade()
+            if (fade > 0f) {
+                // The wallpaper surface can be wider than the screen (the launcher scrolls it).
+                // Size and center the clock on the part you can actually see.
+                val screenW = resources.displayMetrics.widthPixels.toFloat()
+                val viewW = if (screenW > 0f && screenW < w) screenW else w
+                val centerX = xOffset.coerceIn(0f, 1f) * (w - viewW) + viewW / 2f
+                drawClock(canvas, viewW, h, centerX, elapsed, fade)
+            }
 
             if (mountainsOn) {
                 scene.drawMountains(canvas, 1f - ease(elapsed.toFloat() / MOUNTAIN_MS))
             }
         }
 
-        private fun ensureLayout(w: Float, h: Float) {
-            if (w == layoutW && h == layoutH && timeText == layoutText) return
-            layoutW = w
+        private fun ensureLayout(viewW: Float, h: Float) {
+            if (viewW == layoutW && h == layoutH && timeText == layoutText) return
+            layoutW = viewW
             layoutH = h
             layoutText = timeText
 
             var units = GAP * (timeText.length - 1)
             timeText.forEach { units += if (it == ':') COLON_W else 1f }
 
-            val dw = (w * 0.86f) / units
+            val dw = (viewW * 0.86f) / units
             dh = h * 0.40f
             top = h * 0.105f
 
@@ -397,35 +452,58 @@ class ClockWallpaperService : WallpaperService() {
             )
             digitPaint.shader = glass
             dotPaint.shader = glass
-            digitPaint.strokeWidth = TallDigits.strokeWidth(dw)
-            datePaint.textSize = w * 0.05f
+            val stroke = TallDigits.strokeWidth(dw)
+            digitPaint.strokeWidth = stroke
+            datePaint.textSize = viewW * 0.05f
 
+            // Digits are laid out around x = 0; the caller moves them to the middle of the screen.
+            // Then we measure where the ink really is (a "1" is empty on its left side, for
+            // example) and shift the whole group so the visible part sits in the exact middle.
             cells.clear()
-            var x = (w - units * dw) / 2f
+            var x = -units * dw / 2f
+            var inkLeft = Float.MAX_VALUE
+            var inkRight = -Float.MAX_VALUE
             timeText.forEach { ch ->
                 val cw = if (ch == ':') COLON_W * dw else dw
                 val path = if (ch == ':') null else TallDigits.path(ch, x, top, dw, dh)
+                val left: Float
+                val right: Float
+                if (path == null) {
+                    left = x
+                    right = x + cw
+                } else {
+                    path.computeBounds(bounds, true)
+                    left = bounds.left - stroke / 2f + (if (ch == '1') stroke * 0.3f else 0f)
+                    right = bounds.right + stroke / 2f
+                }
+                inkLeft = minOf(inkLeft, left)
+                inkRight = maxOf(inkRight, right)
                 cells.add(Cell(ch, x, cw, path))
                 x += cw + GAP * dw
             }
+            inkShift = -(inkLeft + inkRight) / 2f
         }
 
-        private fun drawClock(canvas: Canvas, w: Float, h: Float, elapsed: Long) {
-            ensureLayout(w, h)
+        private fun drawClock(
+            canvas: Canvas, viewW: Float, h: Float, centerX: Float, elapsed: Long, fade: Float
+        ) {
+            ensureLayout(viewW, h)
 
             val dateP = ease(elapsed.toFloat() / DATE_MS)
-            datePaint.alpha = (238 * dateP).toInt()
+            datePaint.alpha = (238 * dateP * fade).toInt()
             canvas.drawText(
                 dateText,
-                w / 2f,
+                centerX,
                 h * 0.075f + (1f - dateP) * h * 0.012f,
                 datePaint
             )
 
+            canvas.save()
+            canvas.translate(centerX + inkShift, 0f)
             cells.forEachIndexed { index, cell ->
                 // each digit starts a little after the one before it
                 val p = ease((elapsed - index * STAGGER_MS).toFloat() / DIGIT_MS)
-                val alpha = (255 * p).toInt()
+                val alpha = (255 * p * fade).toInt()
                 digitPaint.alpha = alpha
                 dotPaint.alpha = alpha
                 val scale = 0.9f + 0.1f * p
@@ -443,6 +521,7 @@ class ClockWallpaperService : WallpaperService() {
                 }
                 canvas.restore()
             }
+            canvas.restore()
         }
     }
 }

@@ -1,6 +1,5 @@
 package com.example.ioslock
 
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.CornerPathEffect
 import android.graphics.LinearGradient
@@ -85,15 +84,5 @@ class Scene {
         canvas.translate(0f, rise * h * 0.07f)
         canvas.drawPath(front, mountainPaint)
         canvas.restore()
-    }
-
-    /** A still picture of the scenery with no clock, used as a home screen picture. */
-    fun renderBitmap(width: Int, height: Int, index: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        update(width.toFloat(), height.toFloat(), index)
-        drawSky(canvas)
-        drawMountains(canvas, 0f)
-        return bmp
     }
 }

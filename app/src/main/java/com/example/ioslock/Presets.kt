@@ -10,17 +10,11 @@ class Preset(
 object Presets {
     const val PREFS = "clock_prefs"
     const val KEY = "preset"
-    const val KEY_TARGET = "target"
     const val KEY_ANIM = "animate"
     const val KEY_MOUNTAINS = "mountains"
     const val KEY_BG_MODE = "bg_mode"            // 0 = color preset, 1 = my photo
     const val KEY_BG_VERSION = "bg_version"      // goes up each time the photo changes
-    const val KEY_PENDING_LOCK_ONLY = "pending_lock_only"
     const val PHOTO_FILE = "background.jpg"
-
-    const val TARGET_LOCK = 0
-    const val TARGET_HOME = 1
-    const val TARGET_BOTH = 2
 
     val all: List<Preset> = listOf(
         Preset(
